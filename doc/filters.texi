@@ -14882,6 +14882,14 @@ Pass through last frame if input duration has not been reached yet.
 @end table
 The default is @code{round}.
 
+Frames are selected from their presentation timestamps and the clip range.
+The rounding method only decides how a frame timestamp is mapped onto an
+output timestamp; the end of input is compared against the output frame
+boundaries using its exact, unrounded value. As a result an output slot whose
+start time still falls inside the clip is kept even when the input timebase
+is too coarse to represent the remaining duration, and the same material
+expressed in equivalent timebases produces the same output.
+
 If timestamp rounding would otherwise discard every frame, one frame is
 retained when its rounded timestamp equals both the first output timestamp
 and the rounded end of input. This exception extends the output beyond the

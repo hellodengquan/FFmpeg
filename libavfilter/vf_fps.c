@@ -82,7 +82,8 @@ typedef struct FPSContext {
 
     /* Runtime state */
     int      status;        ///< buffered input status
-    int64_t  status_pts;    ///< buffered input status timestamp
+    int64_t  status_pts;    ///< buffered input status timestamp, in output timebase
+    int64_t  status_pts_in; ///< buffered input status timestamp, in input timebase
     int64_t  last_in_pts;   ///< last frame timestamp in input timebase
     int      last_frame_trimmed; ///< last frame ends at or before start_time
 
@@ -120,12 +121,32 @@ static const AVOption fps_options[] = {
 
 AVFILTER_DEFINE_CLASS(fps);
 
+/*
+ * Frame selection between buffered frames uses the timestamps rounded onto the
+ * output grid; rounding there merely decides which output slot a frame labels.
+ * The end of input is handled differently: rounding it into a coarse input
+ * timebase could move the clip boundary onto an earlier slot and discard a
+ * slot that is still inside the clip.  It is therefore compared against the
+ * exact, unrounded end of input with av_compare_ts(), which performs no
+ * rounding, so the result does not depend on the input timebase granularity.
+ */
+
+/* True when the exact end of input (EOF) is at or before the exact time of
+ * output slot n. */
+static int eof_at_or_before_slot(AVFilterLink *inlink, AVFilterLink *outlink,
+                                 FPSContext *s, int64_t n)
+{
+    return av_compare_ts(s->status_pts_in - s->in_pts_off, inlink->time_base,
+                         n - s->out_pts_off, outlink->time_base) <= 0;
+}
+
 static av_cold int init(AVFilterContext *ctx)
 {
     FPSContext *s = ctx->priv;
 
-    s->status_pts   = AV_NOPTS_VALUE;
-    s->next_pts     = AV_NOPTS_VALUE;
+    s->status_pts     = AV_NOPTS_VALUE;
+    s->status_pts_in  = AV_NOPTS_VALUE;
+    s->next_pts       = AV_NOPTS_VALUE;
 
     return 0;
 }
@@ -263,7 +284,8 @@ static int read_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *inlink,
 }
 
 /* Write a frame to the output */
-static int write_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *outlink, int *again)
+static int write_frame(AVFilterContext *ctx, FPSContext *s,
+                       AVFilterLink *inlink, AVFilterLink *outlink, int *again)
 {
     AVFrame *frame;
     int eof_before_or_at_next;
@@ -286,7 +308,19 @@ static int write_frame(AVFilterContext *ctx, FPSContext *s, AVFilterLink *outlin
         }
     }
 
-    eof_before_or_at_next = s->status && s->status_pts <= s->next_pts;
+    /* Frame selection between two buffered frames follows the timestamps
+     * rounded onto the output grid: a frame labelled with slot L is the
+     * content of that slot.  The only place where rounding the input timebase
+     * could change the result is the end of input, which may collapse onto an
+     * earlier slot in a coarse timebase and drop a slot that is still inside
+     * the clip.  The EOF boundary is therefore compared against the exact end
+     * of input instead of its rounded label. */
+    eof_before_or_at_next = s->status &&
+                            eof_at_or_before_slot(inlink, outlink, s, s->next_pts);
+    /* Keep the documented rounding-based exception: if the end of input
+     * rounds onto the first output timestamp together with the only frame,
+     * retain one frame rather than emitting nothing.  Frames whose whole
+     * interval is trimmed by start_time stay discarded. */
     first_output_due      = !s->frames_out && !s->cur_frame_out &&
                             !s->last_frame_trimmed &&
                             s->frames[0]->pts == s->next_pts &&
@@ -336,6 +370,9 @@ static void update_eof_pts(AVFilterContext *ctx, FPSContext *s, AVFilterLink *in
                             s->start_time != AV_NOPTS_VALUE &&
                             s->last_in_pts < s->in_pts_off &&
                             status_pts <= s->in_pts_off;
+    /* Keep the exact end of input for frame selection; the rounded value is
+     * only used to label the stream status forwarded downstream. */
+    s->status_pts_in = status_pts;
     s->status_pts = av_rescale_q_rnd(status_pts, inlink->time_base, outlink->time_base,
                                      eof_rounding | AV_ROUND_PASS_MINMAX);
 
@@ -381,7 +418,7 @@ static int activate(AVFilterContext *ctx)
 
     /* Buffered frames are available, so generate an output frame */
     if (s->frames_count > 0) {
-        ret = write_frame(ctx, s, outlink, &again);
+        ret = write_frame(ctx, s, inlink, outlink, &again);
         /* Couldn't generate a frame, so schedule us to perform another step */
         if (again && ff_inoutlink_check_flow(inlink, outlink))
             ff_filter_set_ready(ctx, 100);

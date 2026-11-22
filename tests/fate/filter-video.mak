@@ -542,6 +542,12 @@ FATE_FILTER-$(call FILTERFRAMECRC, FPS TESTSRC2 SETPTS SETTB) += fate-filter-fps
 fate-filter-fps-single-cross-start: CMD = framecrc -lavfi testsrc2=s=16x16:r=25/2:d=0.08,settb=1/25,setpts=PTS-1,fps=1:start_time=0
 fate-filter-fps-single-cross-start: REF = $(SRC_PATH)/tests/ref/fate/filter-fps-single
 
+# The end of input extends past the last frame; frame selection must follow
+# the exact presentation times rather than the EOF rounded into a coarse input
+# timebase, so the output does not depend on the input timebase granularity.
+FATE_FILTER-$(call FILTERFRAMECRC, FPS TESTSRC2 SETPTS SETTB TRIM) += fate-filter-fps-eof-coarse-timebase
+fate-filter-fps-eof-coarse-timebase: CMD = framecrc -lavfi "testsrc2=s=16x16:r=10:d=2,settb=1/100,setpts=if(eq(N\,0)\,0\,34),trim=duration=0.34,fps=fps=3"
+
 FATE_LIBAVFILTER-yes += fate-filter-drawutils
 fate-filter-drawutils: libavfilter/tests/drawutils$(EXESUF)
 fate-filter-drawutils: CMD = run libavfilter/tests/drawutils$(EXESUF)
