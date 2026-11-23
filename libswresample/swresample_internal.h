@@ -22,6 +22,7 @@
 #define SWRESAMPLE_SWRESAMPLE_INTERNAL_H
 
 #include "swresample.h"
+#include "libavutil/audio_fifo.h"
 #include "libavutil/channel_layout.h"
 #include "config.h"
 
@@ -162,6 +163,13 @@ struct SwrContext {
     int drop_output;                                ///< number of output samples to drop
     double delayed_samples_fixup;                   ///< soxr 0.1.1: needed to fixup delayed_samples after flush has been called.
 
+    AVAudioFifo *frame_fifo;                        ///< output samples converted but not yet delivered by the AVFrame API
+    enum AVSampleFormat frame_fifo_fmt;             ///< output sample format of the staged samples
+    int frame_fifo_ch;                              ///< output channel count of the staged samples
+    int frame_fifo_rate;                            ///< output sample rate of the staged samples
+    int frame_drained;                              ///< 1 if the current conversion state has been fully drained
+    AudioData frame_tmp;                            ///< scratch buffer used by the AVFrame API
+
     struct AudioConvert *in_convert;                ///< input conversion context
     struct AudioConvert *out_convert;               ///< output conversion context
     struct AudioConvert *full_convert;              ///< full conversion context (single conversion for input and output)
@@ -201,6 +209,7 @@ struct SwrContext {
 av_warn_unused_result
 int swri_realloc_audio(AudioData *a, int count);
 int swri_check_chlayout(struct SwrContext *s, const AVChannelLayout *chl, const char *name);
+void swri_frame_free(SwrContext *s);
 
 void swri_noise_shaping_int16 (SwrContext *s, AudioData *dsts, const AudioData *srcs, const AudioData *noises, int count);
 void swri_noise_shaping_int32 (SwrContext *s, AudioData *dsts, const AudioData *srcs, const AudioData *noises, int count);

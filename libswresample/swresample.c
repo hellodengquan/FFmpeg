@@ -138,6 +138,7 @@ av_cold void swr_free(SwrContext **ss){
     SwrContext *s= *ss;
     if(s){
         clear_context(s);
+        swri_frame_free(s);
         av_channel_layout_uninit(&s->user_in_chlayout);
         av_channel_layout_uninit(&s->user_out_chlayout);
         av_channel_layout_uninit(&s->user_used_chlayout);

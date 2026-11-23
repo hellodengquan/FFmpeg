@@ -1198,6 +1198,12 @@ FATE_SWR_REALLOC-$(CONFIG_SWRESAMPLE) += fate-swr-resample-realloc
 fate-swr-resample-realloc: libswresample/tests/swresample_resample_realloc$(EXESUF)
 fate-swr-resample-realloc: CMD = run libswresample/tests/swresample_resample_realloc$(EXESUF)
 
+FATE_SWR_FRAME-$(CONFIG_SWRESAMPLE) += fate-swr-frame-format-change
+fate-swr-frame-format-change: libswresample/tests/swresample_frame$(EXESUF)
+fate-swr-frame-format-change: CMD = run libswresample/tests/swresample_frame$(EXESUF)
+
+FATE_SWR += $(FATE_SWR_FRAME-yes)
+
 # A subset of the 10000 default cases to keep the run time short
 FATE_SWR_SELFTEST-$(CONFIG_SWRESAMPLE) += fate-swr-selftest
 fate-swr-selftest: libswresample/tests/swresample$(EXESUF)

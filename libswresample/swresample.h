@@ -548,10 +548,23 @@ const char *swresample_license(void);
  * remaining samples. To get this data as output, call this function or
  * swr_convert() with NULL input.
  *
- * If the SwrContext configuration does not match the output and
- * input AVFrame settings the conversion does not take place and depending on
- * which AVFrame is not matching AVERROR_OUTPUT_CHANGED, AVERROR_INPUT_CHANGED
- * or the result of a bitwise-OR of them is returned.
+ * The input AVFrame may change its channel layout, sample format and sample
+ * rate between calls. When that happens the samples accepted so far are first
+ * converted to completion with the previous configuration, so the tail of the
+ * old segment keeps its place ahead of the new one, and conversion then
+ * continues with the new configuration. The amount of output space provided by
+ * the caller only affects how many samples are returned per call, not the
+ * resulting sample stream. The output configuration is fixed for the lifetime
+ * of a handover and cannot change between calls; a frame whose output format,
+ * layout or rate differs from the configured one is rejected with
+ * AVERROR_OUTPUT_CHANGED.
+ *
+ * If the new input configuration cannot be used, AVERROR_INPUT_CHANGED is
+ * returned. The samples that belong to the previous configuration remain
+ * available and can still be retrieved by calling this function with NULL
+ * input; the caller may then retry with a configuration that is accepted.
+ * Output sample positions are contiguous across the handover, so the results
+ * can be concatenated directly.
  *
  * @see swr_delay()
  * @see swr_convert()

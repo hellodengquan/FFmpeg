@@ -1,0 +1,9 @@
+format-change: ret=0 rejected=0 samples=20260
+format-change accepted: yes
+batch-size-independent (space=37): yes
+batch-size-independent (space=148): yes
+batch-size-independent (space=592): yes
+batch-size-independent (space=2368): yes
+rejected-format-keeps-accepted: ret=0 rejected=1 samples=20260 ref=20260 -> yes
+rate-change: ret=0 samples=20976 expected~20975 -> yes
+format-change-samplefmt: ret=0 samples=20260 ref=20260 -> yes
