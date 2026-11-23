@@ -243,7 +243,7 @@ typedef struct MatroskaTrackAudio {
     int      sub_packet_size;
     int      sub_packet_cnt;
     int      pkt_cnt;
-    uint64_t buf_timecode;
+    int64_t  buf_timecode;
     uint8_t *buf;
 } MatroskaTrackAudio;
 
@@ -2041,12 +2041,14 @@ static void matroska_add_index_entries(MatroskaDemuxContext *matroska)
             MatroskaTrack *track = matroska_find_track_by_num(matroska,
                                                               pos[j].track);
             if (track && track->stream) {
-                int64_t ts = index[i].time / index_scale;
-                // A cue holds a rounded block timestamp, before the codec
-                // delay; the skip after a seek absorbs the rounding.
-                if (track->exact_audio)
-                    ts = av_rescale_q(ts, track->tick_tb,
-                                      track->stream->time_base);
+                // A cue time is in segment ticks; a block's is in the ticks
+                // of its own track's clock, so land on the same instant
+                // whichever the index describes. A cue holds a rounded block
+                // timestamp, before the codec delay; the skip after a seek
+                // absorbs the rounding.
+                int64_t ts = av_rescale_q(index[i].time / index_scale,
+                                          (AVRational) { (int64_t) matroska->time_scale, 1000000000 },
+                                          track->stream->time_base);
                 av_add_index_entry(track->stream,
                                    pos[j].pos + matroska->segment_start,
                                    ts, 0, 0, AVINDEX_KEYFRAME);
@@ -3442,6 +3444,11 @@ static int matroska_parse_tracks(AVFormatContext *s)
         avpriv_set_pts_info(st, 64, matroska->time_scale * track->time_scale,
                             1000 * 1000 * 1000);    /* 64 bit pts in ns */
 
+        /* The clock the blocks of this track are timed against. A block's
+         * offset from its cluster is in track ticks, and the cluster time
+         * is rescaled from the segment ticks to these. */
+        track->tick_tb = st->time_base;
+
         /* convert the delay from ns to the track timebase */
         track->codec_delay_in_track_tb = av_rescale_q(track->codec_delay,
                                                       (AVRational){ 1, 1000000000 },
@@ -3860,7 +3867,7 @@ static int matroska_parse_laces(MatroskaDemuxContext *matroska, uint8_t **buf,
 
 static int matroska_parse_rm_audio(MatroskaDemuxContext *matroska,
                                    MatroskaTrack *track, AVStream *st,
-                                   uint8_t *data, int size, uint64_t timecode,
+                                   uint8_t *data, int size, int64_t timecode,
                                    int64_t pos)
 {
     const int a   = st->codecpar->block_align;
@@ -4045,8 +4052,8 @@ static int matroska_parse_webvtt(MatroskaDemuxContext *matroska,
                                  MatroskaTrack *track,
                                  AVStream *st,
                                  uint8_t *data, int data_len,
-                                 uint64_t timecode,
-                                 uint64_t duration,
+                                 int64_t timecode,
+                                 int64_t duration,
                                  int64_t pos)
 {
     AVPacket *pkt = matroska->pkt;
@@ -4305,7 +4312,7 @@ static int matroska_parse_block_additional(MatroskaDemuxContext *matroska,
 static int matroska_parse_frame(MatroskaDemuxContext *matroska,
                                 MatroskaTrack *track, AVStream *st,
                                 AVBufferRef *buf, uint8_t *data, int pkt_size,
-                                uint64_t timecode, uint64_t lace_duration,
+                                int64_t timecode, int64_t lace_duration,
                                 int64_t pos, int is_keyframe,
                                 MatroskaBlockMore *blockmore, int nb_blockmore,
                                 int64_t discard_padding)
@@ -4429,7 +4436,7 @@ static int matroska_parse_block(MatroskaDemuxContext *matroska, AVBufferRef *buf
                                 MatroskaBlockMore *blockmore, int nb_blockmore,
                                 int64_t cluster_pos, int64_t discard_padding)
 {
-    uint64_t timecode = AV_NOPTS_VALUE;
+    int64_t timecode = AV_NOPTS_VALUE;
     MatroskaTrack *track;
     FFIOContext pb;
     int res = 0;
@@ -4476,41 +4483,56 @@ static int matroska_parse_block(MatroskaDemuxContext *matroska, AVBufferRef *buf
 
     if (cluster_time != (uint64_t) -1 &&
         (block_time >= 0 || cluster_time >= -block_time)) {
-        uint64_t timecode_cluster_in_track_tb = (double) cluster_time / track->time_scale;
-        timecode = timecode_cluster_in_track_tb + block_time;
-        if (track->exact_audio) {
-            int64_t ts = av_rescale_q(timecode, track->tick_tb, st->time_base);
-            // The clock only places the packets after a gap: the others
-            // continue the one before, or, after a seek, sit on the grid
-            // of packets that starts at the earliest one read.
-            if (track->grid_origin == AV_NOPTS_VALUE || ts < track->grid_origin)
-                track->grid_origin = ts;
-            if (track->next_pts != AV_NOPTS_VALUE &&
-                FFABS(ts - track->next_pts) <= track->ts_tolerance) {
-                ts = track->next_pts;
-            } else if (track->grid_step > 0 && !track->grid_varies) {
-                int64_t on_grid = track->grid_origin +
-                    av_rescale_rnd(ts - track->grid_origin, 1,
-                                   track->grid_step, AV_ROUND_NEAR_INF) *
-                    track->grid_step;
-                if (FFABS(on_grid - ts) <= track->ts_tolerance)
-                    ts = on_grid;
+        /* A block's time is a signed offset from its cluster, given in the
+         * ticks of the track's own clock, while the cluster time is in
+         * segment ticks and the clock of a track may run at another rate
+         * (TrackTimestampScale). Rescale the cluster time to the track's
+         * clock, rounding to the nearest tick, so that a block keeps the
+         * position it is authored at when read across clusters and an index
+         * entry on the segment axis names the same position. */
+        uint64_t segment_ts = FFMIN(cluster_time, (uint64_t) INT64_MAX);
+        // av_rescale_q_rnd() returns INT64_MIN on overflow.
+        int64_t cluster_ts = av_rescale_q_rnd(segment_ts,
+                                              (AVRational) { (int64_t) matroska->time_scale, 1000000000 },
+                                              track->tick_tb,
+                                              AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        if (cluster_ts != INT64_MIN &&
+            (block_time <= 0 || cluster_ts <= INT64_MAX - block_time)) {
+            timecode = cluster_ts + block_time;
+            if (track->exact_audio) {
+                int64_t ts = av_rescale_q(timecode, track->tick_tb, st->time_base);
+                // The clock only places the packets after a gap: the others
+                // continue the one before, or, after a seek, sit on the grid
+                // of packets that starts at the earliest one read.
+                if (track->grid_origin == AV_NOPTS_VALUE || ts < track->grid_origin)
+                    track->grid_origin = ts;
+                if (track->next_pts != AV_NOPTS_VALUE &&
+                    FFABS(ts - track->next_pts) <= track->ts_tolerance) {
+                    ts = track->next_pts;
+                } else if (track->grid_step > 0 && !track->grid_varies) {
+                    int64_t on_grid = track->grid_origin +
+                        av_rescale_rnd(ts - track->grid_origin, 1,
+                                       track->grid_step, AV_ROUND_NEAR_INF) *
+                        track->grid_step;
+                    if (FFABS(on_grid - ts) <= track->ts_tolerance)
+                        ts = on_grid;
+                }
+                timecode = ts;
             }
-            timecode = ts;
-        }
-        timecode -= track->codec_delay_in_track_tb;
-        if (track->type == MATROSKA_TRACK_TYPE_SUBTITLE &&
-            timecode < track->end_timecode)
-            is_keyframe = 0;  /* overlapping subtitles are not key frame */
-        if (is_keyframe) {
-            // The index of a best-fit track holds block timestamps, as cues
-            // do.
-            int64_t index_ts = timecode;
-            if (track->exact_audio)
-                index_ts += track->codec_delay_in_track_tb;
-            ff_reduce_index(matroska->ctx, st->index);
-            av_add_index_entry(st, cluster_pos, index_ts, 0, 0,
-                               AVINDEX_KEYFRAME);
+            timecode -= track->codec_delay_in_track_tb;
+            if (track->type == MATROSKA_TRACK_TYPE_SUBTITLE &&
+                timecode < track->end_timecode)
+                is_keyframe = 0;  /* overlapping subtitles are not key frame */
+            if (is_keyframe) {
+                // The index of a best-fit track holds block timestamps, as cues
+                // do.
+                int64_t index_ts = timecode;
+                if (track->exact_audio)
+                    index_ts += track->codec_delay_in_track_tb;
+                ff_reduce_index(matroska->ctx, st->index);
+                av_add_index_entry(st, cluster_pos, index_ts, 0, 0,
+                                   AVINDEX_KEYFRAME);
+            }
         }
     }
 
@@ -4592,9 +4614,9 @@ static int matroska_parse_block(MatroskaDemuxContext *matroska, AVBufferRef *buf
         laces_in_samples = block_samples > 0;
     }
 
-    if (cluster_time != (uint64_t)-1 && (block_time >= 0 || cluster_time >= -block_time))
+    if (timecode != AV_NOPTS_VALUE)
         track->end_timecode =
-            FFMAX(track->end_timecode, timecode + block_duration);
+            FFMAX(track->end_timecode, av_sat_add64(timecode, block_duration));
 
     for (n = 0; n < laces; n++) {
         int64_t lace_duration = laces_in_samples ? lace_samples[n] :
