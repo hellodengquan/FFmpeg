@@ -542,3 +542,96 @@ FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MOV, HEVC, HEVC_PARSER SCALE_FILTER) += fat
 # alpha merging
 fate-ffmpeg-heif-merge-alpha: CMD = framecrc -auto_conversion_filters -i $(TARGET_SAMPLES)/heif/alpha.heic
 FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MOV, HEVC, HEVC_PARSER SCALE_FILTER) += fate-ffmpeg-heif-merge-alpha
+
+# One PQ HDR master is graded into several deliverables in a single pass: the
+# untouched PQ one, a BT.2020 HLG one and one re-graded to BT.709 SDR. The
+# stream level and per-frame colour declarations of each deliverable must
+# describe the primaries and transfer that deliverable actually uses, so that
+# a downstream player picks the display mode from the delivered picture and
+# not from the master. The mastering display and content light level side data
+# describe a PQ grade, so they may only be carried by the deliverable that
+# keeps that transfer; the HLG and SDR siblings must not inherit them even
+# though all three read the same input.
+fate-ffmpeg-hdr-deliverable-color: CMD = \
+    pq="$$(target_path "$${outfile}.pq.mkv")"; \
+    hlg="$$(target_path "$${outfile}.hlg.mkv")"; \
+    sdr="$$(target_path "$${outfile}.sdr.mkv")"; \
+    cleanfiles="$${cleanfiles} $${pq} $${hlg} $${sdr}"; \
+    ffmpeg -v error -y -i $(TARGET_SAMPLES)/hevc/hdr10_plus_h265_sample.hevc \
+        -filter_complex "[0:v]split=3[pq][hlg][sdr];[pq]format=yuv420p10le[pqout];[hlg]scale=in_color_matrix=bt2020nc:in_primaries=bt2020:in_transfer=smpte2084:out_color_matrix=bt2020nc:out_primaries=bt2020:out_transfer=arib-std-b67,format=yuv420p10le[hlgout];[sdr]scale=in_color_matrix=bt2020nc:in_primaries=bt2020:in_transfer=smpte2084:out_color_matrix=bt709:out_primaries=bt709:out_transfer=bt709,format=yuv420p[sdrout]" \
+        -map "[pqout]"  -c:v ffv1 -f matroska "$${pq}" \
+        -map "[hlgout]" -c:v ffv1 -f matroska "$${hlg}" \
+        -map "[sdrout]" -c:v ffv1 -f matroska "$${sdr}" && \
+    echo "=== pq: stream" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -show_entries stream=color_range,color_space,color_primaries,color_transfer:stream_side_data_list "$${pq}" && \
+    echo "=== pq: first frame" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -read_intervals %+\#1 -show_frames -show_entries frame=color_range,color_space,color_primaries,color_transfer:frame_side_data_list "$${pq}" && \
+    echo "=== hlg: stream" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -show_entries stream=color_range,color_space,color_primaries,color_transfer:stream_side_data_list "$${hlg}" && \
+    echo "=== hlg: first frame" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -read_intervals %+\#1 -show_frames -show_entries frame=color_range,color_space,color_primaries,color_transfer:frame_side_data_list "$${hlg}" && \
+    echo "=== sdr: stream" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -show_entries stream=color_range,color_space,color_primaries,color_transfer:stream_side_data_list "$${sdr}" && \
+    echo "=== sdr: first frame" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -read_intervals %+\#1 -show_frames -show_entries frame=color_range,color_space,color_primaries,color_transfer:frame_side_data_list "$${sdr}"
+FATE_SAMPLES_FFMPEG_FFPROBE-$(call ALLYES, HEVC_DEMUXER HEVC_DECODER FFV1_ENCODER \
+                                              MATROSKA_MUXER SPLIT_FILTER FORMAT_FILTER \
+                                              SCALE_FILTER FILE_PROTOCOL) \
+                               += fate-ffmpeg-hdr-deliverable-color
+
+# Per-frame scope of the master's HDR side data. Every frame of the untouched
+# PQ deliverable still describes its own display intent (mastering display,
+# content light level and HDR10+ dynamic metadata), while the HLG and SDR
+# siblings must carry none of it: those side data all describe a PQ grade, so
+# a frame of a re-graded deliverable carrying them would make a downstream
+# player apply the wrong interpretation. The frames are counted inside the
+# filter chain, where the side data is still visible even for the entries the
+# encoder and container would not transport.
+fate-ffmpeg-hdr-frame-side-data-scope: CMD = \
+    bad=; \
+    for d in "pq:format=yuv420p10le" \
+             "hlg:scale=in_color_matrix=bt2020nc:in_primaries=bt2020:in_transfer=smpte2084:out_color_matrix=bt2020nc:out_primaries=bt2020:out_transfer=arib-std-b67,format=yuv420p10le" \
+             "sdr:scale=in_color_matrix=bt2020nc:in_primaries=bt2020:in_transfer=smpte2084:out_color_matrix=bt709:out_primaries=bt709:out_transfer=bt709,format=yuv420p"; do \
+        name="$${d%%:*}"; chain="$${d#*:}"; \
+        for t in MASTERING_DISPLAY_METADATA CONTENT_LIGHT_LEVEL DYNAMIC_HDR_PLUS; do \
+            f="$$(target_path "$${outfile}.$${name}.$${t}.crc")"; \
+            cleanfiles="$${cleanfiles} $${f}"; \
+            ffmpeg -v error -y -i $(TARGET_SAMPLES)/hevc/hdr10_plus_h265_sample.hevc \
+                   -vf "$${chain},sidedata=mode=select:type=$${t}" -f framecrc "$${f}" || bad=1; \
+            n=$$(grep -c "^0," "$${f}" 2>/dev/null); \
+            echo "$${name} $${t} frames=$${n}"; \
+        done; \
+    done; \
+    test -z "$${bad}"
+FATE_SAMPLES_FFMPEG-$(call ALLYES, HEVC_DEMUXER HEVC_DECODER FORMAT_FILTER SCALE_FILTER \
+                                         SIDEDATA_FILTER FRAMECRC_MUXER FILE_PROTOCOL) \
+                     += fate-ffmpeg-hdr-frame-side-data-scope
+
+# Two deliverables share one HDR10+ input: one is a bitstream copy that keeps
+# the master's HDR interpretation, the other is re-graded to BT.709 SDR. The
+# copied deliverable must still declare BT.2020 PQ and still export the
+# per-frame HDR10+ dynamic metadata, while the re-graded sibling declares
+# BT.709 and carries neither the HDR tags nor the dynamic metadata. The master
+# carries no stream level colour tags of its own, so the copy's stream
+# declaration comes from the output tags; the re-graded sibling must not
+# inherit those tags from the shared input.
+fate-ffmpeg-hdr-deliverable-dynamic: CMD = \
+    hdr="$$(target_path "$${outfile}.hdr.mkv")"; \
+    sdr="$$(target_path "$${outfile}.sdr.mkv")"; \
+    cleanfiles="$${cleanfiles} $${hdr} $${sdr}"; \
+    ffmpeg -v error -y -i $(TARGET_SAMPLES)/mkv/hdr10_plus_vp9_sample.webm \
+        -filter_complex "[0:v]scale=in_color_matrix=bt2020nc:in_primaries=bt2020:in_transfer=smpte2084:out_color_matrix=bt709:out_primaries=bt709:out_transfer=bt709,format=yuv420p[sdrout]" \
+        -map 0:v -c:v copy -color_primaries:v bt2020 -color_trc:v smpte2084 -colorspace:v bt2020nc -f matroska "$${hdr}" \
+        -map "[sdrout]" -c:v ffv1 -f matroska "$${sdr}" && \
+    echo "=== hdr: stream" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -show_entries stream=color_range,color_space,color_primaries,color_transfer "$${hdr}" && \
+    echo "=== hdr: first frame" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -read_intervals %+\#1 -show_frames -show_entries frame=color_primaries,color_transfer:frame_side_data=side_data_type,targeted_system_display_maximum_luminance "$${hdr}" && \
+    echo "=== sdr: stream" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -show_entries stream=color_range,color_space,color_primaries,color_transfer "$${sdr}" && \
+    echo "=== sdr: first frame" && \
+    run ffprobe$(PROGSSUF)$(EXESUF) -v 0 -bitexact -threads $$threads -select_streams v -read_intervals %+\#1 -show_frames -show_entries frame=color_primaries,color_transfer:frame_side_data=side_data_type,targeted_system_display_maximum_luminance "$${sdr}"
+FATE_SAMPLES_FFMPEG_FFPROBE-$(call ALLYES, MATROSKA_DEMUXER VP9_DECODER VP9_PARSER \
+                                              FFV1_ENCODER MATROSKA_MUXER SCALE_FILTER \
+                                              FORMAT_FILTER FILE_PROTOCOL) \
+                               += fate-ffmpeg-hdr-deliverable-dynamic
